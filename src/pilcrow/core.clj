@@ -1,82 +1,8 @@
 (ns pilcrow.core
   (:require
    [clojure.string :as str]
-   [clojure.zip :as zip]))
+   [clojure.set :as set]))
 
-;; (defn- return [v]
-;;   (fn [input] (list [v input])))
-
-;; (defn- failure [_] '())
-
-;; (defn- parse [parser input] (parser input))
-;; (defn- parse-all [parser input]
-;;   (->> input
-;;        (parse parser)
-;;        (filter #(= "" (second %)))
-;;        ffirst))
-
-;; (defn- >>= [parser f]
-;;   (fn [input]
-;;     (->> input
-;;          (parse parser)
-;;          (mapcat (fn [[v tail]] (parse (f v) tail))))))
-
-;; (defn merge-bind [body bind]
-;;   (if (and (not= clojure.lang.Symbol (type bind))
-;;            (= 3 (count bind))
-;;            (= '<- (second bind)))
-;;     `(>>= ~(last bind) (fn [~(first bind)] ~body))
-;;     `(>>= ~bind (fn [~'_] ~body))))
-
-;; (defmacro do* [& forms]
-;;   (reduce merge-bind (last forms) (reverse (butlast forms))))
-
-;; (defn- any [input]
-;;   (if (empty? input) '()
-;;       (list [(first input)
-;;              (apply str (rest input))])))
-
-;; (defn- sat [pred]
-;;   (>>= any (fn [v] (if (pred v) (return v) failure))))
-
-;; (defn- char-cmp [f]
-;;   (fn [c] (sat (partial f (first c)))))
-
-;; (def match (char-cmp =))
-;; (def none-of (char-cmp not=))
-
-;; (declare plus)
-;; (declare optional)
-
-;; (defn- and-then [p1 p2]
-;;   (do*
-;;    (r1 <- p1)
-;;    (r2 <- p2)
-;;    (return (str r1 r2))))
-
-;; (defn- or-else [p1 p2]
-;;   (fn [input]
-;;     (lazy-cat (parse p1 input) (parse p2 input))))
-
-;; (defn- many [parser] (optional (plus parser)))
-
-;; (defn- plus [parser]
-;;   (do*
-;;    (a <- parser)
-;;    (as <- (many parser))
-;;    (return (cons a as))))
-
-;; (defn- optional [parser] (or-else parser (return "")))
-
-
-;; (defn string [s] (reduce and-then (map #(match (str %)) s)))
-
-;; (def blank-line (match "\n"))
-
-;; (parse-all (do* (optional (and-then (match "\n") (match "\n")))
-;;                 (p <- (many (none-of "\n")))
-;;                 (return (apply str p)))
-;;            "foo")
 
 (defn empty-tag? [[tag & content]]
   (and (empty? content)
@@ -90,7 +16,7 @@
 
 (defn- cset [s] (set (map identity s)))
 (def whitespace #{\space \tab 0x202F 0x205F 0x3000 0xA0})
-(def section-char (cset "§#"))
+(def section-char (cset "§#="))
 
 (defmulti open (fn [type parent-tag node line] type))
 
@@ -111,26 +37,55 @@
                 {:keep-empty? true}))
        nil])))
 
+(defn- block-marker? [level line]
+  (and level
+       (not-empty line)
+       (contains? (cset "|") (.charAt line 0))
+       (every? #(contains? (cset "=") %) (take level (drop 1 line)))))
+
+(defmethod open :block [_ parent-tag node line]
+  (let [block-level (if (= :block (:tag parent-tag)) (inc (:level parent-tag)) 1)]
+    (when-let [block-type (and (block-marker? block-level line)
+                               (contains? whitespace (first (drop (inc block-level) line)))
+                               (second (re-matches #"\|=+\s+([-\w]+)" line)))]
+      [{:tag :block :type block-type :level block-level :keep-empty? true} nil])))
+
 (defmethod open :paragraph [_ parent-tag node line]
   (when (and (nil? node) (not-empty line))
     [{:tag :paragraph} line]))
 
 (defmulti line-closes? (fn [[open-tag & c] line] (:tag open-tag)))
 
+(defmethod line-closes? :block [[open-tag & c] line]
+  (and (block-marker? (:level open-tag) line)
+       (let [etc (drop (inc (:level open-tag)) line)]
+         (or (empty? etc)
+             (contains? whitespace etc)))))
+
 (defmethod line-closes? :paragraph [open-node line] (empty? line))
 (defmethod line-closes? :default [_ _] false)
 
-(def children {:document [:section]
-               :header [:paragraph]
-               :section [:section :paragraph]})
+(def children {:block #{:block :paragraph}
+               :document #{:section}
+               :header #{:block :paragraph}
+               :section #{:section :block :paragraph}})
+
+(def siblings {:block #{:block}
+               :header #{:section}
+               :section #{:section}})
 
 (declare line-rules)
 
 (defn- line-opens [root-node open-node line]
-  (->> (get children (:tag root-node))
-       (map #(open % root-node open-node line))
-       (filter identity)
-       first))
+  (let [open-siblings (get siblings (:tag (first open-node)))
+        root-children (get children (:tag root-node))
+        possible-siblings (if open-siblings
+                            (set/intersection open-siblings root-children)
+                            root-children)]
+    (->> possible-siblings
+         (map #(open % root-node open-node line))
+         (filter identity)
+         first)))
 
 (defn close-node [this-node next-node]
   (cond
@@ -177,6 +132,4 @@
 
 (defn parse [input]
   (split-chunks input))
-
-
 
