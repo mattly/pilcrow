@@ -3,20 +3,58 @@
    [clojure.string :as str]
    [clojure.set :as set]))
 
-
-(defn empty-tag? [[tag & content]]
-  (and (empty? content)
-       (nil? (:keep-empty? tag))))
-
 (defn remove-empties [[tag & content]]
   (if (and (empty? content)
-           (nil? (:keep-empty? tag)))
+           (nil? (::keep-empty? tag)))
     nil
-    (into [(dissoc tag :keep-empty?)] content)))
+    (into [(dissoc tag ::keep-empty?)] content)))
 
 (defn- cset [s] (set (map identity s)))
 (def whitespace #{\space \tab 0x202F 0x205F 0x3000 0xA0})
 (def section-char (cset "§#="))
+
+(defn- regex? [re]
+  (= java.util.regex.Pattern (type re)))
+
+(defn split-before [s p]
+  (if (= 1 (count s))
+    [s ""]
+    (->> s
+         (split-at
+          (first
+           (filter
+            #(let [tail (apply str (drop % s))]
+              (cond
+                (empty? tail) true
+                (string? p) (str/starts-with? tail p)
+                (set? p) (contains? p (first tail))
+                (regex? p) (re-find (re-pattern (str "^" (.toString p))) tail)))
+            (range 1 (inc (count s))))))
+         (mapv #(apply str %)))))
+
+(defn- split-whitespace [s accum]
+  (when (contains? whitespace (first s))
+    (let [[_ nstr] (split-before s #"[^\s]")]
+      [nstr accum])))
+
+(defn- split-classname [s accum]
+  (when (= \. (first s))
+    (let [[c nstr] (split-before s #"[^-\w]")]
+      [nstr (update accum :class conj (keyword (apply str (rest c))))])))
+
+(defn- split-title [s accum]
+  (when (re-find #"[a-zA-Z0-9]" s)
+    ["" (assoc accum :title (str/replace s #"[\s=#§]*$" ""))]))
+
+(defn- extract-attrs
+  ([attrstr] (extract-attrs attrstr {:class #{} :title ""}))
+  ([attrstr accum]
+   (if (empty? attrstr)
+     accum
+     (let [[nextstr attrs] (or (split-whitespace attrstr accum)
+                               (split-classname attrstr accum)
+                               (split-title attrstr accum))]
+       (recur nextstr attrs)))))
 
 (defmulti open (fn [type parent-tag node line] type))
 
@@ -24,17 +62,18 @@
   (when (and (not-empty line)
              (contains? #{:document :section} (:tag parent-tag))
              (every? #(contains? section-char %) (take (inc (:level parent-tag)) line))
-             (contains? whitespace (.charAt line (inc (:level parent-tag)))))
-    (let [sn (re-find #"\w[^=]*" line)
-          tag (case [(:level parent-tag) (str/lower-case sn)]
+             (not (contains? section-char (.charAt line (inc (:level parent-tag))))))
+    (let [attrs (extract-attrs (apply str (drop (inc (:level parent-tag)) line)))
+          tag (case [(:level parent-tag) (str/lower-case (or (:title attrs) ""))]
                 [0 "header"] :header
                 :section)]
       [(merge {:tag tag
-               :name (str/trim (or sn ""))
+               :name (str/trim (or (:title attrs) ""))
+               :class (:class attrs)
                :leader (first line)
                :level (inc (:level parent-tag))}
               (when (contains? #{:header} tag)
-                {:keep-empty? true}))
+                {::keep-empty? true}))
        nil])))
 
 (defn- block-marker? [level line]
@@ -45,10 +84,16 @@
 
 (defmethod open :block [_ parent-tag node line]
   (let [block-level (if (= :block (:tag parent-tag)) (inc (:level parent-tag)) 1)]
-    (when-let [block-type (and (block-marker? block-level line)
-                               (contains? whitespace (first (drop (inc block-level) line)))
-                               (second (re-matches #"\|=+\s+([-\w]+)" line)))]
-      [{:tag :block :type block-type :level block-level :keep-empty? true} nil])))
+    (when-let [[_ block-type attrstr]
+               (and (block-marker? block-level line)
+                    (contains? whitespace (first (drop (inc block-level) line)))
+                    (re-matches #"\|=+\s+([-\w]+)(.*)" line))]
+      (let [attrs (extract-attrs attrstr)]
+        [{:tag :block
+          :type block-type
+          :level block-level
+          :class (:class attrs)
+          ::keep-empty? true} nil]))))
 
 (defmethod open :paragraph [_ parent-tag node line]
   (when (and (nil? node) (not-empty line))
