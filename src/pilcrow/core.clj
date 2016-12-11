@@ -1,13 +1,37 @@
 (ns pilcrow.core
   (:require
+   [clojure.pprint :refer [pprint]]
    [clojure.string :as str]
    [clojure.set :as set]))
 
-(defn remove-empties [[tag & content]]
-  (if (and (empty? content)
-           (nil? (::keep-empty? tag)))
+;; ===============
+(defrecord Either [left right])
+(defn left [err] (Either. err nil))
+(defn right [val] (Either. nil val))
+(defn right? [either] (nil? (:left either)))
+(def left? (comp not right?))
+(def right-value :right)
+(def left-value :left)
+
+(defn bind [v f]
+  (if (left? v) v (-> v right-value f)))
+
+(defn fmap [v f]
+  (if (left? v) v (-> v right-value f right)))
+(defn lift [v]
+  (if (right? v) (right-value v) (left-value v)))
+
+(defn branch [v fl fr]
+  (if (left? v) (-> v left-value fl) (-> v right-value fr)))
+(defn branch-left [v fl]
+  (if (left? v) (-> v left-value fl) v))
+;; =================
+
+(defn remove-empties [{:keys [children] :as node}]
+  (if (and (empty? children)
+           (nil? (::keep-empty? node)))
     nil
-    (into [(dissoc tag ::keep-empty?)] content)))
+    (dissoc node ::keep-empty?)))
 
 (defn- cset [s] (set (map identity s)))
 (def whitespace #{\space \tab 0x202F 0x205F 0x3000 0xA0})
@@ -56,25 +80,28 @@
                                (split-title attrstr accum))]
        (recur nextstr attrs)))))
 
-(defmulti open (fn [type parent-tag node line] type))
+(defmulti open-node (fn [type parent-node active-node line] type))
 
-(defmethod open :section [_ parent-tag node line]
+(defmethod open-node :section
+  [_ {:keys [level type] :or {level 0} :as parent-tag} active-node [_ line]]
   (when (and (not-empty line)
-             (contains? #{:document :section} (:tag parent-tag))
-             (every? #(contains? section-char %) (take (inc (:level parent-tag)) line))
-             (not (contains? section-char (.charAt line (inc (:level parent-tag))))))
-    (let [attrs (extract-attrs (apply str (drop (inc (:level parent-tag)) line)))
-          tag (case [(:level parent-tag) (str/lower-case (or (:title attrs) ""))]
-                [0 "header"] :header
-                :section)]
-      [(merge {:tag tag
-               :name (str/trim (or (:title attrs) ""))
-               :class (:class attrs)
-               :leader (first line)
-               :level (inc (:level parent-tag))}
-              (when (contains? #{:header} tag)
-                {::keep-empty? true}))
-       nil])))
+             (contains? #{:document :section} type)
+             (contains? section-char (first line))
+             (every? #(= (first line) %) (take (inc level) line))
+             (not (contains? section-char (.charAt line (inc level)))))
+    (let [attrs (extract-attrs (apply str (drop (inc level) line)))
+          this-type (case [level (str/lower-case (or (:title attrs) ""))]
+                      [0 "header"] :header
+                      :section)]
+      (merge {:type this-type
+              :name (str/trim (or (:title attrs) ""))
+              :class (:class attrs)
+              :leader (first line)
+              :level (inc level)
+              :children []
+              :content []}
+             (when (contains? #{:header} this-type)
+               {::keep-empty? true})))))
 
 (defn- block-marker? [level line]
   (and level
@@ -82,99 +109,97 @@
        (contains? (cset "|") (.charAt line 0))
        (every? #(contains? (cset "=") %) (take level (drop 1 line)))))
 
-(defmethod open :block [_ parent-tag node line]
-  (let [block-level (if (= :block (:tag parent-tag)) (inc (:level parent-tag)) 1)]
+(defmethod open-node :block
+  [_ {:keys [level type] :as parent-node} active-node [_ line]]
+  (let [block-level (if (= :block type) (inc level) 1)]
     (when-let [[_ block-type attrstr]
                (and (block-marker? block-level line)
                     (contains? whitespace (first (drop (inc block-level) line)))
                     (re-matches #"\|=+\s+([-\w]+)(.*)" line))]
       (let [attrs (extract-attrs attrstr)]
-        [{:tag :block
-          :type block-type
+        {:type :block
+          :block-type block-type
           :level block-level
           :class (:class attrs)
-          ::keep-empty? true} nil]))))
+          :children []
+          :content []
+          ::keep-empty? true}))))
 
-(defmethod open :paragraph [_ parent-tag node line]
-  (when (and (nil? node) (not-empty line))
-    [{:tag :paragraph} line]))
+(defmethod open-node :paragraph [_ parent-node active-node [lno lco :as line]]
+  (when (and (nil? active-node) (not-empty lco))
+    {:type :paragraph :children [] :content [line]}))
 
-(defmulti line-closes? (fn [[open-tag & c] line] (:tag open-tag)))
-
-(defmethod line-closes? :block [[open-tag & c] line]
-  (and (block-marker? (:level open-tag) line)
-       (let [etc (drop (inc (:level open-tag)) line)]
-         (or (empty? etc)
-             (contains? whitespace etc)))))
-
-(defmethod line-closes? :paragraph [open-node line] (empty? line))
-(defmethod line-closes? :default [_ _] false)
 
 (def children {:block #{:block :paragraph}
                :document #{:section}
                :header #{:block :paragraph}
                :section #{:section :block :paragraph}})
 
-(def siblings {:block #{:block}
-               :header #{:section}
-               :section #{:section}})
+(def closing-siblings
+  {:block #{:block}
+   :header #{:section}
+   :section #{:section}})
 
-(declare line-rules)
+(defmulti line-closes-node? (fn [open-child line] (:type open-child)))
+(defmethod line-closes-node? :default [_ _] false)
+(defmethod line-closes-node? :paragraph [_ line] (empty? line))
+(defmethod line-closes-node? :block [{:keys [level] :as block} line]
+  (and (block-marker? level line)
+       (let [etc (drop (inc level) line)]
+         (empty? etc))))
 
-(defn- line-opens [root-node open-node line]
-  (let [open-siblings (get siblings (:tag (first open-node)))
-        root-children (get children (:tag root-node))
-        possible-siblings (if open-siblings
-                            (set/intersection open-siblings root-children)
-                            root-children)]
-    (->> possible-siblings
-         (map #(open % root-node open-node line))
-         (filter identity)
-         first)))
+(defn line-opens-node [parent-node active-node [lno lco :as line]]
+  (when (not-empty lco)
+    (let [possibles (if active-node
+                      (get closing-siblings (:type active-node))
+                      (get children (:type parent-node)))]
+      (->> possibles
+           (map #(open-node % parent-node active-node line))
+           (filter identity)
+           first))))
 
-(defn close-node [this-node next-node]
-  (cond
-    (vector? this-node)
-    (let [[node & content] this-node]
-      [(case (:tag node)
-         :paragraph [node (str/join " " content)]
-         (line-rules this-node))
-       next-node])
+(declare process-node-content)
 
-    (nil? this-node)
-    [next-node]
+(defn close-node [node]
+  (when (and node (:type node))
+    (if (contains? #{:paragraph} (:type node))
+      (-> node
+          (assoc :children (map second (:content node)))
+          (dissoc :content))
+      (process-node-content node))))
 
-    :else [this-node next-node]))
+(defn process-node-line
+  [{:keys [children active-node content]
+    :as parent-node}
+   [[line-no line-content :as line] & lines]]
+  (let [[next-active append-children]
+        (or (when (line-closes-node? active-node line-content)
+              [nil active-node])
+            (when-let [next-child
+                       (line-opens-node parent-node active-node line)]
+              [next-child active-node])
+            (when active-node
+              [(update active-node :content conj line)])
+            [])
+        next-parent (merge parent-node
+                           {:active-node next-active}
+                           (when append-children
+                             {:children (conj children append-children)}))]
+    (if (empty? lines)
+      (-> next-parent
+          (update :children conj (:active-node next-parent))
+          (update :children #(map close-node %))
+          (update :children #(filter identity %))
+          (dissoc :active-node :content)
+          remove-empties)
+      (recur next-parent lines))))
 
-(defn line-rules [[root-node & lines :as root]]
-  (let [last-line-no (- (count lines) 1)]
-    (->> lines
-         (reduce
-          (fn [[node-info & children :as parent] line]
-            (let [this-node (last children)
-                  head (into [node-info] (butlast children))]
-              (or (when (line-closes? this-node line)
-                    (apply conj head (close-node this-node nil)))
-                  (when-let [next-node (line-opens root-node this-node line)]
-                    (apply conj head (close-node this-node next-node)))
-                  (when this-node
-                    (conj head (conj this-node line)))
-                  parent)))
-          [root-node])
-         ((fn [nodes]
-            (let [head (vec (butlast nodes))
-                  tail (last nodes)]
-              (into head (close-node tail nil)))))
-         (filterv identity)
-         remove-empties)))
-
-(defn split-chunks
-  [input]
-  (->> input
-       str/split-lines
-       (into [{:tag :document :level 0} [{:tag :section :level 1 :name "Preamble"}]])
-       line-rules))
+(defn process-node-content [{:keys [content] :as node}]
+  (process-node-line (dissoc node :content) content))
 
 (defn parse [input]
-  (split-chunks input))
+  (process-node-content
+   {:type :document
+    :children []
+    :content (map #(vector %1 %2) (map inc (range)) (str/split-lines input))}))
 
