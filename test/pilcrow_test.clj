@@ -7,18 +7,51 @@
    [com.gfredericks.test.chuck.clojure-test :refer [checking]]
    [pilcrow.core :as pilcrow]))
 
-(def lorem "Lorem ipsum dolor sit amet")
+(def lorem "Lorem ipsum dolor sit amet ümlaut")
 
 (def gen-word
   (gen/elements (set (str/split lorem #"\s"))))
 
+(defn gen-inword-span [span-type]
+  (gen/let [word gen-word
+            start (gen/choose 1 (- (count word) 2))
+            close (gen/choose (inc start) (- (count word) 1))]
+    (let [[head tail] (split-at close word)
+          [pre content] (split-at start head)]
+      [(apply str pre)
+       {:type span-type :children [(apply str content)]}
+       (apply str tail)])))
+
+(defn- str-accum [[this-in & rest-in] out]
+  (let [newout
+        (cond (and (string? this-in) (string? (first out)))
+              (conj (rest out) (str (first out) " " this-in))
+              (string? this-in)
+              (conj out this-in)
+              (map? this-in)
+              (conj out this-in))]
+    (if (empty? rest-in)
+      (reverse newout)
+      (recur rest-in newout))))
+
 (def gen-phrase
-  (gen/fmap #(str/join " " %)
+  (gen/fmap #(str-accum (flatten %) '())
+            (gen/vector
+             (gen/frequency [[10 gen-word]
+                             [10 (gen-inword-span :bold)]])
+             1 10)))
+
+(defn gen-span-phrase [span-type]
+  (gen/fmap (fn [words] {:type span-type
+                         :children [(str/join " " words)]})
             (gen/vector gen-word 1 5)))
 
 (def gen-paragraph
-  (gen/fmap (fn [s] {:type :paragraph :children s})
-            (gen/vector gen-phrase 1 20)))
+  (gen/fmap (fn [s] {:type :paragraph :children (str-accum (flatten s) '())})
+            (gen/vector
+             (gen/frequency [[10 gen-phrase
+                              1 (gen-span-phrase :bold)]])
+             1 10)))
 
 (defn gen-some-of [gens]
   (gen/such-that
@@ -140,10 +173,11 @@
 
     (map? node)
     (case (:type node)
+      :bold (str "**" (str/join (:children node)) "**")
       :block (render-block node)
       :document (render-children node)
       :header (render-section node)
-      :paragraph (str (str/join "\n" (:children node)) "\n\n")
+      :paragraph (str (render-children node) "\n\n")
       :section (render-section node)
       (str "\n{unknown node type: " (:type node) "}\n"))))
 
@@ -168,9 +202,3 @@
       (is (= scrubbed parsed)
           (str "----\n" rendered "\n----")))))
 
-;; (deftest parsing-errors
-;;   (testing "can't skip section levels"
-;;     (let [doc "# One\n\nSome Text\n\n### Three\n\nMore Text"
-;;           parsed (pilcrow/parse doc)]
-;;       (is (= {:error [3 :illegal-section-nesting]}
-;;              parsed)))))

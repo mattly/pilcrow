@@ -4,29 +4,6 @@
    [clojure.string :as str]
    [clojure.set :as set]))
 
-;; ===============
-(defrecord Either [left right])
-(defn left [err] (Either. err nil))
-(defn right [val] (Either. nil val))
-(defn right? [either] (nil? (:left either)))
-(def left? (comp not right?))
-(def right-value :right)
-(def left-value :left)
-
-(defn bind [v f]
-  (if (left? v) v (-> v right-value f)))
-
-(defn fmap [v f]
-  (if (left? v) v (-> v right-value f right)))
-(defn lift [v]
-  (if (right? v) (right-value v) (left-value v)))
-
-(defn branch [v fl fr]
-  (if (left? v) (-> v left-value fl) (-> v right-value fr)))
-(defn branch-left [v fl]
-  (if (left? v) (-> v left-value fl) v))
-;; =================
-
 (defn remove-empties [{:keys [children] :as node}]
   (if (and (empty? children)
            (nil? (::keep-empty? node)))
@@ -36,6 +13,7 @@
 (defn- cset [s] (set (map identity s)))
 (def whitespace #{\space \tab 0x202F 0x205F 0x3000 0xA0})
 (def section-char (cset "§#="))
+(def attr-class-lead #{\.})
 
 (defn- regex? [re]
   (= java.util.regex.Pattern (type re)))
@@ -52,22 +30,56 @@
                 (empty? tail) true
                 (string? p) (str/starts-with? tail p)
                 (set? p) (contains? p (first tail))
+                (fn? p) (p (first tail))
                 (regex? p) (re-find (re-pattern (str "^" (.toString p))) tail)))
             (range 1 (inc (count s))))))
          (mapv #(apply str %)))))
 
+(defn extract-bold [content idx]
+  (let [[before after] (split-at idx content)
+        close (->> after
+                   (drop 2)
+                   (partition 2 1)
+                   (map (fn [i [c1 c2]] [i (str c1 c2)]) (range))
+                   (filter (fn [[i s]] (= "**" s)))
+                   ffirst)
+        [bold remainder] (split-at (+ 2 close) after)]
+    [[(apply str before)
+      {:type :bold :children [(apply str (drop 2 bold))]}]
+     (apply str (drop 2 remainder))]))
+
+(defn process-text [this-node content idx]
+  (let [this-char (.charAt content idx)
+        [new-nodes next-content]
+        (case this-char
+          \* (extract-bold content idx)
+          [[] content])
+        next-node (update this-node :children #(apply conj % new-nodes))]
+    (cond (or (empty? next-content)
+              (= (count content) (inc idx)))
+          (update this-node :children conj content)
+          (= content next-content) (recur this-node content (inc idx))
+          :default (recur next-node next-content 0))))
+
+(defn process-text-content [{:keys [content] :as node}]
+  (process-text (dissoc node :content)
+                (->> content (map second) (str/join "\n"))
+                0))
+
+
+
 (defn- split-whitespace [s accum]
   (when (contains? whitespace (first s))
-    (let [[_ nstr] (split-before s #"[^\s]")]
+    (let [[_ nstr] (split-before s #(not (contains? whitespace %)))]
       [nstr accum])))
 
 (defn- split-classname [s accum]
-  (when (= \. (first s))
-    (let [[c nstr] (split-before s #"[^-\w]")]
+  (when (contains? attr-class-lead (first s))
+    (let [[c nstr] (split-before s (set/union whitespace section-char attr-class-lead))]
       [nstr (update accum :class conj (keyword (apply str (rest c))))])))
 
 (defn- split-title [s accum]
-  (when (re-find #"[a-zA-Z0-9]" s)
+  (when (not (contains? attr-class-lead (first s)))
     ["" (assoc accum :title (str/replace s #"[\s=#§]*$" ""))]))
 
 (defn- extract-attrs
@@ -82,13 +94,18 @@
 
 (defmulti open-node (fn [type parent-node active-node line] type))
 
+(defn- section-marker? [line]
+  (and (not-empty line)
+       (contains? section-char (first line))
+       (count (take-while #(= % (first line)) line))))
+
 (defmethod open-node :section
-  [_ {:keys [level type] :or {level 0} :as parent-tag} active-node [_ line]]
-  (when (and (not-empty line)
-             (contains? #{:document :section} type)
+  [_ {:keys [level type] :or {level 0} :as parent-tag} active-node [lno line]]
+  (when (and (contains? #{:document :section} type)
+             (not-empty line)
              (contains? section-char (first line))
-             (every? #(= (first line) %) (take (inc level) line))
-             (not (contains? section-char (.charAt line (inc level)))))
+             (every? #(= % (first line)) (take (inc level) line))
+             (not (= (first line) (first (drop (inc level) line)))))
     (let [attrs (extract-attrs (apply str (drop (inc level) line)))
           this-type (case [level (str/lower-case (or (:title attrs) ""))]
                       [0 "header"] :header
@@ -115,7 +132,7 @@
     (when-let [[_ block-type attrstr]
                (and (block-marker? block-level line)
                     (contains? whitespace (first (drop (inc block-level) line)))
-                    (re-matches #"\|=+\s+([-\w]+)(.*)" line))]
+                    (re-matches #"\|=+\s+([-\p{L}]+)(.*)" line))]
       (let [attrs (extract-attrs attrstr)]
         {:type :block
           :block-type block-type
@@ -163,13 +180,11 @@
 (defn close-node [node]
   (when (and node (:type node))
     (if (contains? #{:paragraph} (:type node))
-      (-> node
-          (assoc :children (map second (:content node)))
-          (dissoc :content))
+      (process-text-content node)
       (process-node-content node))))
 
 (defn process-node-line
-  [{:keys [children active-node content]
+  [{:keys [children active-node]
     :as parent-node}
    [[line-no line-content :as line] & lines]]
   (let [[next-active append-children]
