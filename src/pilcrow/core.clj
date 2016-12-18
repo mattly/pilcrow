@@ -2,7 +2,8 @@
   (:require
    [clojure.pprint :refer [pprint]]
    [clojure.string :as str]
-   [clojure.set :as set]))
+   [clojure.set :as set]
+   [clojure.zip :as zip]))
 
 (defn remove-empties [{:keys [children] :as node}]
   (if (and (empty? children)
@@ -212,9 +213,119 @@
 (defn process-node-content [{:keys [content] :as node}]
   (process-node-line (dissoc node :content) content))
 
-(defn parse [input]
+(defn parse--old [input]
   (process-node-content
    {:type :document
     :children []
     :content (map #(vector %1 %2) (map inc (range)) (str/split-lines input))}))
+
+;; ===
+(defn read-line [input]
+  (str/split input #"\n" 2))
+
+(defn gather-parents
+  ([zipper] (gather-parents zipper []))
+  ([zipper parents]
+   (let [next-parents (conj parents zipper)
+         next-node (zip/up zipper)]
+     (if (zip/up next-node)
+       (recur next-node next-parents)
+       next-parents))))
+
+(defn section-marker? [line]
+  (when (contains? section-char (first line))
+    (let [marker (take-while #(= (first line) %) line)
+          level (count marker)
+          attrs (extract-attrs (apply str (drop level line)))
+          this-type (case [(count marker) (:title attrs)]
+                      [0 "header"] :header
+                      :section)]
+      [(merge {:type this-type
+               :name (str/trim (or (:title attrs) ""))
+               :level level
+               :class (:class attrs)
+               :leader (first marker)}
+              (when (contains? #{:header} this-type)
+                {::keep-empty? true}))
+       nil])))
+
+(defmulti close-node (fn [node] (-> node first :type)))
+(defmethod close-node :default [node] (filterv not-empty node))
+
+(defn line-open-marker [line]
+  (or (section-marker? line)))
+
+(defn closes-sibling? [active new]
+  (and (contains? (get closing-siblings (:type active))
+                  (:type new))
+       (if-let [level (:level active)]
+         (= level (:level new))
+         true)))
+
+(defn opens-child? [active new]
+  (and (contains? (get children (:type active))
+                  (:type new))
+       (if-let [level (:level active)]
+         (= (inc level) (:level new))
+         true)))
+
+(defn insert-node [zipper node]
+  (as-> zipper $
+    (if (zip/node $)
+      (-> $ (zip/insert-right node) zip/next)
+      (-> $ (zip/replace node)))
+    (if (vector? node)
+      (-> $ zip/next zip/rightmost)
+      $)))
+
+(defn check-parents [zipper line]
+  (let [new-node (line-open-marker line)
+        new-node-info (first new-node)]
+    (->> (gather-parents zipper)
+         (map (fn [node]
+                (let [info (-> node zip/leftmost zip/node)]
+                  (cond
+                    (opens-child? info new-node-info)
+                    (insert-node node new-node)))))
+         (filter identity)
+         first)))
+
+(defn open-new-node-from-line [zipper input info]
+  (let [[line rest-input] (read-line input)]
+    (or (when-let [new-loc (check-parents zipper line)]
+          [new-loc rest-input (update info :line inc)])
+        (when (and (nil? (zip/node zipper))
+                   (not-empty line)
+                   (not= :paragraph (-> zipper zip/leftmost zip/node :type)))
+          [(insert-node zipper [{:type :paragraph} nil]) input info])
+        (when (and (empty? line)
+                   (= :paragraph (-> zipper zip/leftmost zip/node :type)))
+          [(-> zipper zip/up (zip/insert-right nil) zip/right)
+           rest-input
+           (update info :line inc)]))))
+
+(defn close-doc [zipper]
+  (let [next-doc (zip/edit zipper close-node)]
+    (if-let [parent (zip/up next-doc)]
+      (recur parent)
+      next-doc)))
+
+(defn process-input [zipper input info]
+  (let [[new-state new-input new-info]
+        (or (when (:at-start info)
+              (open-new-node-from-line zipper input info))
+            (let [[this-line rest-lines] (read-line input)]
+              (if (not-empty this-line)
+                [(insert-node zipper this-line) rest-lines (update info :line inc)]
+                [zipper rest-lines (update info :line inc)])))]
+    (if (empty? new-input)
+      (close-doc (zip/up new-state))
+      (recur new-state new-input new-info))))
+
+(defn parse [input]
+  (-> [{:type :document} nil]
+      zip/vector-zip
+      zip/next zip/next
+      (process-input input {:line 1 :at-start true})
+      zip/root))
 

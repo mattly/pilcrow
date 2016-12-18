@@ -19,16 +19,20 @@
     (let [[head tail] (split-at close word)
           [pre content] (split-at start head)]
       [(apply str pre)
-       {:type span-type :children [(apply str content)]}
+       #_{:type span-type :children [(apply str content)]}
+       [{:type span-type} (apply str content)]
        (apply str tail)])))
 
 (defn- str-accum [[this-in & rest-in] out]
   (let [newout
         (cond (and (string? this-in) (string? (first out)))
               (conj (rest out) (str (first out) " " this-in))
+
               (string? this-in)
               (conj out this-in)
-              (map? this-in)
+
+              #_(map? this-in)
+              (vector? this-in)
               (conj out this-in))]
     (if (empty? rest-in)
       (reverse newout)
@@ -38,19 +42,22 @@
   (gen/fmap #(str-accum (flatten %) '())
             (gen/vector
              (gen/frequency [[10 gen-word]
-                             [10 (gen-inword-span :bold)]])
+                             #_[10 (gen-inword-span :bold)]])
              1 10)))
 
 (defn gen-span-phrase [span-type]
-  (gen/fmap (fn [words] {:type span-type
-                         :children [(str/join " " words)]})
+  (gen/fmap (fn [words] #_{:type span-type
+                           :children [(str/join " " words)]}
+              [{:type span-type} (str/join " " words)])
             (gen/vector gen-word 1 5)))
 
 (def gen-paragraph
-  (gen/fmap (fn [s] {:type :paragraph :children (str-accum (flatten s) '())})
+  (gen/fmap (fn [s]
+              #_{:type :paragraph :children (str-accum (flatten s) '())}
+              (into [{:type :paragraph}] (str-accum (flatten s) '())))
             (gen/vector
-             (gen/frequency [[10 gen-phrase
-                              1 (gen-span-phrase :bold)]])
+             (gen/frequency [[10 gen-phrase]
+                             #_[1 (gen-span-phrase :bold)]])
              1 10)))
 
 (defn gen-some-of [gens]
@@ -81,13 +88,20 @@
                                     (when (and subsec? (> 4 level))
                                       [3 (gen-block-with-content (inc level))])]))
                                 1 5)]
-    {:type :block
-     :class (:names classes)
-     ::class classes
-     ::trailing trailing
-     :block-type block-type
-     :level level
-     :children children}))
+    (into [{:type :block
+            :class (:names classes)
+            ::class classes
+            ::trailing trailing
+            :block-type block-type
+            :level level}]
+          children)))
+    ;; {:type :block
+    ;;  :class (:names classes)
+    ;;  ::class classes
+    ;;  ::trailing trailing
+    ;;  :block-type block-type
+    ;;  :level level
+    ;;  :children children}))
 
 (defn gen-section-with-content [level]
   (let [msize (max 1 (Math/floor (/ 10 level)))]
@@ -106,35 +120,50 @@
                         [(gen/vector
                           (gen/frequency
                             [[10 gen-paragraph]
-                             [3 (gen-block-with-content 1)]])
+                             #_[3 (gen-block-with-content 1)]])
                           0 5)
                          (when (and subsec (> 6 level))
                            (gen/vector
                             (gen-section-with-content (inc level))
                             0 msize))])]
-      {:type :section
-       :name section-name
-       :class (:names classes)
-       ::class classes
-       ::trailing trailing
-       :level level
-       :leader section-leader
-       :children children})))
+      (into [{:type :section
+              :name section-name
+              :class (:names classes)
+              ::class classes
+              ::trailing trailing
+              :level level
+              :leader section-leader}]
+            children))))
+      ;; {:type :section
+      ;;  :name section-name
+      ;;  :class (:names classes)
+      ;;  ::class classes
+      ;;  ::trailing trailing
+      ;;  :level level
+      ;;  :leader section-leader
+      ;;  :children children})))
 
 (def gen-document
   (gen/fmap
-   (fn [[head body]] {:type :document :children (concat [head] body)})
+   (fn [[head body]] (into [{:type :document} head] body))
    (gen/let
        [head (gen/one-of
               [(gen/return nil)
                (gen/fmap
                 (fn [{:keys [children leader]}]
-                  {:type :header
-                   :level 1
-                   :leader leader
-                   :class #{}
-                   :name "Header"
-                   :children children})
+                  (into
+                   [{:type :header
+                     :level 1
+                     :leader leader
+                     :class #{}
+                     :name "Header"}]
+                   children))
+                  ;; {:type :header
+                  ;;  :level 1
+                  ;;  :leader leader
+                  ;;  :class #{}
+                  ;;  :name "Header"
+                  ;;  :children children})
                 (gen/hash-map
                  :children (gen/vector gen-paragraph 0 3)
                  :leader (gen/elements pilcrow/section-char)))])
@@ -149,49 +178,56 @@
             (map #(str "." (name %)))
             (str/join (if (::inter-spaces classes) " " "")))))
 
-(defn render-section [section]
+(defn render-section [[section & children :as node]] #_[section]
   (str (str/join (take (:level section) (repeat (str (:leader section)))))
        (render-class (::class section))
        " " (:name section)
        (when-let [n (::trailing section)]
          (apply str " " (take n (repeat (str (:leader section))))))
        "\n\n"
-       (render-children section)))
+       (render-children node #_section)))
 
-(defn render-block [block]
+(defn render-block [[block & children :as node]] #_[block]
   (let [delim (str/join (take (:level block) (repeat "=")))]
     (str "|" delim
          " " (:block-type block)
          (render-class (::class block))
          "\n"
-         (render-children block) "\n"
+         (render-children node #_block) "\n"
          "|" delim "\n")))
 
 (defn render [node]
   (cond
+    (nil? node) ""
     (string? node) node
 
-    (map? node)
-    (case (:type node)
-      :bold (str "**" (str/join (:children node)) "**")
+    #_(map? node)
+    (vector? node)
+    (case #_(:type node) (:type (first node))
+      :bold (str "**" (str/join (drop 1 node)) "**")
       :block (render-block node)
       :document (render-children node)
       :header (render-section node)
       :paragraph (str (render-children node) "\n\n")
       :section (render-section node)
-      (str "\n{unknown node type: " (:type node) "}\n"))))
+      (str "\n{unknown node type: " (:type (first node)) "}\n"))))
 
-(defn render-children [{:keys [children]}]
+(defn render-children [[info & children]] #_[{:keys [children]}]
   (->> children (map render) str/join))
+
 
 (defn remove-ns-keys [m]
   (apply dissoc m (filter namespace (keys m))))
 
 (defn scrub [node]
   (cond (string? node) node
-        (map? node)
-        (-> (remove-ns-keys node)
-            (update :children (fn [c] (->> c (filter identity) (map scrub)))))))
+        #_(map? node)
+        ;; (-> (remove-ns-keys node)
+        ;;     (update :children (fn [c] (->> c (filter identity) (map scrub)))))))
+        (vector? node)
+        (let [[info & children] node]
+          (into [(remove-ns-keys info)]
+                (->> children (filter identity) (map scrub))))))
 
 (deftest document
   (checking "parses document" {:num-tests 50}
