@@ -66,7 +66,6 @@
 
 (def gen-classes
   (gen/hash-map
-   ::leading-space gen/boolean
    ::inter-spaces gen/boolean
    :names (gen/set (gen/fmap (comp keyword #(str/join "-" %))
                              (gen/vector gen-word 1 3)))))
@@ -109,7 +108,7 @@
                         [(gen/vector
                           (gen/frequency
                             [[10 gen-paragraph]
-                             #_[3 (gen-block-with-content 1)]])
+                             [3 (gen-block-with-content 1)]])
                           0 5)
                          (when (and subsec (> 6 level))
                            (gen/vector
@@ -148,7 +147,7 @@
 (declare render-children)
 
 (defn- render-class [classes]
-  (str (when (::leading-space classes " "))
+  (str " "
        (->> (:names classes)
             (map #(str "." (name %)))
             (str/join (if (::inter-spaces classes) " " "")))))
@@ -165,9 +164,8 @@
 (defn render-block [[block & children :as node]]
   (let [delim (str/join (take (:level block) (repeat "=")))]
     (str "|" delim
-         " " (:block-type block)
          (render-class (::class block))
-         "\n"
+         " " (:block-type block) "\n"
          (render-children node) "\n"
          "|" delim "\n")))
 
@@ -208,4 +206,3 @@
           parsed (pilcrow/parse rendered)]
       (is (= scrubbed parsed)
           (str "----\n" rendered "\n----")))))
-

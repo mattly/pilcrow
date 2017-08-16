@@ -84,6 +84,7 @@
   (when (not (contains? attr-class-lead (first s)))
     ["" (assoc accum :title (str/replace s #"[\s=#§]*$" ""))]))
 
+;; in use by section, block
 (defn- extract-attrs
   ([attrstr] (extract-attrs attrstr {:class #{} :title ""}))
   ([attrstr accum]
@@ -258,10 +259,41 @@
                 {::keep-empty? true}))
        nil])))
 
+(defn smells-like-block-marker? [line]
+  (and (= \| (first line)) (= \= (second line))))
+
+(defn read-block-marker [line]
+  (when (smells-like-block-marker? line)
+    (let [marker (->> line (drop 1) (take-while #(= (second line) %)))
+          level (count marker)
+          attrs (extract-attrs (apply str (drop (inc level) line)))
+          block-type (str/trim (:title attrs))]
+      [{:type :block
+        :block-type block-type
+        :level level
+        :class (:class attrs)}
+       nil])))
+
+(defn read-block-open-marker [line]
+  (when-let [[info :as marker] (read-block-marker line)]
+    (when (not-empty (:block-type info)) marker)))
+
+(defn read-block-close-marker [line]
+  (when-let [[info :as marker] (read-block-marker line)]
+    (when (and (empty? (:block-type info)) (empty? (:class info)))
+      marker)))
+
 (defn line-open-marker
   "If this line is an opening marker, returns a node."
   [line]
-  (or (read-section-marker line)))
+  (or (read-section-marker line)
+      (read-block-open-marker line)))
+
+(line-open-marker "|== block")
+
+(defn line-close-marker
+  [line]
+  (or (read-block-close-marker line)))
 
 (defn closes-sibling? [active new]
   (and (contains? (get closing-siblings (:type active))
@@ -270,12 +302,13 @@
          (= level (:level new))
          true)))
 
-(defn opens-child? [active new]
-  (and (contains? (get children (:type active))
-                  (:type new))
-       (if-let [level (:level active)]
-         (= (inc level) (:level new))
-         true)))
+(defn opens-child?
+  [{active-type :type active-level :level}
+   {new-type :type new-level :level}]
+  (and (contains? (get children active-type) new-type)
+       (cond
+         (= active-type new-type) (= (inc active-level) new-level)
+         :default (= 1 new-level))))
 
 (defn insert-node
   "Inserts `node` at the end of `zipper`"
@@ -288,6 +321,9 @@
       (-> $ zip/down zip/rightmost)
       $)))
 
+(defn close-node [node]
+  (-> node zip/up (zip/insert-right nil) zip/right))
+
 (defn check-parents
   "If the current line opens a new node, checks to see if that node closes
   its previous sibling or is a child of the new node. If not, ignore it.
@@ -295,20 +331,28 @@
   TODO it should probably raise a parser error if the new node is not a valid
   child."
   [zipper line]
-  (let [new-node (line-open-marker line)
-        new-node-info (first new-node)]
-    (when new-node
-      (->> (gather-parents zipper)
-           (map (fn [node]
-                  (let [info (-> node zip/leftmost zip/node)]
-                    (cond
-                      (closes-sibling? info new-node-info)
-                      (-> node zip/up (insert-node new-node))
+  (or
+   (when-let [new-node (line-open-marker line)]
+     (->> (gather-parents zipper)
+          (map (fn [node]
+                 (let [info (-> node zip/leftmost zip/node)]
+                   (cond
+                     (closes-sibling? info (first new-node))
+                     (-> node zip/up (insert-node new-node))
 
-                      (opens-child? info new-node-info)
-                      (insert-node node new-node)))))
-           (filter identity)
-           first))))
+                     (opens-child? info (first new-node))
+                     (insert-node node new-node)))))
+          (filter identity)
+          first))
+   (when-let [close (line-close-marker line)]
+     (->> (gather-parents zipper)
+          (map (fn [node]
+
+                 (when
+                   (closes-sibling? (-> node zip/leftmost zip/node) (first close))
+                   (-> node zip/up (zip/insert-right nil) zip/right))))
+          (filter identity)
+          first))))
 
 (defn open-new-node-from-line
   "If the line opens a new node, move there. If we're not in a node, opens a
@@ -401,13 +445,9 @@
 This is some section content.
 This is a second line in the first paragraph.
 
-This is another paragraph.
+|= block
+block contents
+|=
 
-## This is a subsection
-
-And this is its contents
-
-# Section Two
-
-Section Two Rocks!
+Post block contents
 "))
