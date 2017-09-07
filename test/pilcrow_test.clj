@@ -22,25 +22,34 @@
        [{:type span-type} (apply str content)]
        (apply str tail)])))
 
-(defn- str-accum [[this-in & rest-in] out]
-  (let [newout
-        (cond (and (string? this-in) (string? (first out)))
-              (conj (rest out) (str (first out) " " this-in))
+(defn- str-accum
+  ([input] (str-accum input '()))
+  ([[this-in & rest-in] out]
+   (let [newout
+         (cond (and (string? this-in) (string? (first out)))
+           (conj (rest out) (str (first out) " " this-in))
 
-              (string? this-in)
-              (conj out this-in)
+           (string? this-in)
+           (conj out this-in)
 
-              (vector? this-in)
-              (conj out this-in))]
-    (if (empty? rest-in)
-      (reverse newout)
-      (recur rest-in newout))))
+           (vector? this-in)
+           (conj out this-in))]
+     (if (empty? rest-in)
+       (reverse newout)
+       (recur rest-in newout)))))
+
+(defn flatten-text-content [text-content]
+  (->> text-content
+       (mapcat identity)
+       (str-accum)))
+
+(str-accum '(["ipsum"] [["am" [{:type :bold} "e"] "t"]]) '())
 
 (def gen-phrase
-  (gen/fmap #(str-accum (flatten %) '())
+  (gen/fmap flatten-text-content
             (gen/vector
-             (gen/frequency [[10 gen-word]
-                             #_[10 (gen-inword-span :bold)]])
+             (gen/frequency [[10 (gen/fmap vector gen-word)]
+                             [3 (gen-inword-span :bold)]])
              1 10)))
 
 (defn gen-span-phrase [span-type]
@@ -50,10 +59,10 @@
 
 (def gen-paragraph
   (gen/fmap (fn [s]
-              (into [{:type :paragraph}] (str-accum (flatten s) '())))
+              (into [{:type :paragraph}] (mapcat identity s)))
             (gen/vector
              (gen/frequency [[10 gen-phrase]
-                             #_[1 (gen-span-phrase :bold)]])
+                             [1 (gen-span-phrase :bold)]])
              1 10)))
 
 (defn gen-some-of [gens]
@@ -68,7 +77,8 @@
   (gen/hash-map
    ::inter-spaces gen/boolean
    :names (gen/set (gen/fmap (comp keyword #(str/join "-" %))
-                             (gen/vector gen-word 1 3)))))
+                             (gen/vector gen-word 1 3))
+                   {:max-elements 10})))
 
 (defn gen-block-with-content [level]
   (gen/let [block-type gen-word
@@ -186,7 +196,6 @@
 
 (defn render-children [[info & children]]
   (->> children (map render) str/join))
-
 
 (defn remove-ns-keys [m]
   (apply dissoc m (filter namespace (keys m))))

@@ -46,8 +46,8 @@
                    (filter (fn [[i s]] (= "**" s)))
                    ffirst)
         [bold remainder] (split-at (+ 2 close) after)]
-    [[(apply str before)
-      {:type :bold :children [(apply str (drop 2 bold))]}]
+    [(apply str before)
+     [{:type :bold} (apply str (drop 2 bold))]
      (apply str (drop 2 remainder))]))
 
 (defn process-text [this-node content idx]
@@ -63,12 +63,9 @@
           (= content next-content) (recur this-node content (inc idx))
           :default (recur next-node next-content 0))))
 
-(defn process-text-content [{:keys [content] :as node}]
-  (process-text (dissoc node :content)
-                (->> content (map second) (str/join "\n"))
-                0))
 
-
+(defn process-paragraph []
+  (process-text ))
 
 (defn- split-whitespace [s accum]
   (when (contains? whitespace (first s))
@@ -84,7 +81,6 @@
   (when (not (contains? attr-class-lead (first s)))
     ["" (assoc accum :title (str/replace s #"[\s=#§]*$" ""))]))
 
-;; in use by section, block
 (defn- extract-attrs
   ([attrstr] (extract-attrs attrstr {:class #{} :title ""}))
   ([attrstr accum]
@@ -95,133 +91,16 @@
                                (split-title attrstr accum))]
        (recur nextstr attrs)))))
 
-(defmulti open-node (fn [type parent-node active-node line] type))
-
-(defn- section-marker? [line]
-  (and (not-empty line)
-       (contains? section-char (first line))
-       (count (take-while #(= % (first line)) line))))
-
-(defmethod open-node :section
-  [_ {:keys [level type] :or {level 0} :as parent-tag} active-node [lno line]]
-  (when (and (contains? #{:document :section} type)
-             (not-empty line)
-             (contains? section-char (first line))
-             (every? #(= % (first line)) (take (inc level) line))
-             (not (= (first line) (first (drop (inc level) line)))))
-    (let [attrs (extract-attrs (apply str (drop (inc level) line)))
-          this-type (case [level (str/lower-case (or (:title attrs) ""))]
-                      [0 "header"] :header
-                      :section)]
-      (merge {:type this-type
-              :name (str/trim (or (:title attrs) ""))
-              :class (:class attrs)
-              :leader (first line)
-              :level (inc level)
-              :children []
-              :content []}
-             (when (contains? #{:header} this-type)
-               {::keep-empty? true})))))
-
-(defn- block-marker? [level line]
-  (and level
-       (not-empty line)
-       (contains? (cset "|") (.charAt line 0))
-       (every? #(contains? (cset "=") %) (take level (drop 1 line)))))
-
-(defmethod open-node :block
-  [_ {:keys [level type] :as parent-node} active-node [_ line]]
-  (let [block-level (if (= :block type) (inc level) 1)]
-    (when-let [[_ block-type attrstr]
-               (and (block-marker? block-level line)
-                    (contains? whitespace (first (drop (inc block-level) line)))
-                    (re-matches #"\|=+\s+([-\p{L}]+)(.*)" line))]
-      (let [attrs (extract-attrs attrstr)]
-        {:type :block
-          :block-type block-type
-          :level block-level
-          :class (:class attrs)
-          :children []
-          :content []
-          ::keep-empty? true}))))
-
-(defmethod open-node :paragraph [_ parent-node active-node [lno lco :as line]]
-  (when (and (nil? active-node) (not-empty lco))
-    {:type :paragraph :children [] :content [line]}))
-
-;; keep - in use by opens-child?
 (def children {:block #{:block :paragraph}
                :document #{:section :header}
                :header #{:block :paragraph}
                :section #{:section :block :paragraph}})
-;; in use by closes-sibling?
+
 (def closing-siblings
   {:block #{:block}
    :header #{:section}
    :section #{:section}})
 
-(defmulti line-closes-node? (fn [open-child line] (:type open-child)))
-(defmethod line-closes-node? :default [_ _] false)
-(defmethod line-closes-node? :paragraph [_ line] (empty? line))
-(defmethod line-closes-node? :block [{:keys [level] :as block} line]
-  (and (block-marker? level line)
-       (let [etc (drop (inc level) line)]
-         (empty? etc))))
-
-(defn line-opens-node [parent-node active-node [lno lco :as line]]
-  (when (not-empty lco)
-    (let [possibles (if active-node
-                      (get closing-siblings (:type active-node))
-                      (get children (:type parent-node)))]
-      (->> possibles
-           (map #(open-node % parent-node active-node line))
-           (filter identity)
-           first))))
-
-(declare process-node-content)
-
-(defn close-node [node]
-  (when (and node (:type node))
-    (if (contains? #{:paragraph} (:type node))
-      (process-text-content node)
-      (process-node-content node))))
-
-(defn process-node-line
-  [{:keys [children active-node]
-    :as parent-node}
-   [[line-no line-content :as line] & lines]]
-  (let [[next-active append-children]
-        (or (when (line-closes-node? active-node line-content)
-              [nil active-node])
-            (when-let [next-child
-                       (line-opens-node parent-node active-node line)]
-              [next-child active-node])
-            (when active-node
-              [(update active-node :content conj line)])
-            [])
-        next-parent (merge parent-node
-                           {:active-node next-active}
-                           (when append-children
-                             {:children (conj children append-children)}))]
-    (if (empty? lines)
-      (-> next-parent
-          (update :children conj (:active-node next-parent))
-          (update :children #(map close-node %))
-          (update :children #(filter identity %))
-          (dissoc :active-node :content)
-          remove-empties)
-      (recur next-parent lines))))
-
-(defn process-node-content [{:keys [content] :as node}]
-  (process-node-line (dissoc node :content) content))
-
-(defn parse--old [input]
-  (process-node-content
-   {:type :document
-    :children []
-    :content (map #(vector %1 %2) (map inc (range)) (str/split-lines input))}))
-
-;; === working
 (defn read-line
   "Given an input string, returns a tuple of the contents before the first
   newline and the contents after it."
@@ -259,11 +138,8 @@
                 {::keep-empty? true}))
        nil])))
 
-(defn smells-like-block-marker? [line]
-  (and (= \| (first line)) (= \= (second line))))
-
 (defn read-block-marker [line]
-  (when (smells-like-block-marker? line)
+  (when (and (= \| (first line)) (= \= (second line)))
     (let [marker (->> line (drop 1) (take-while #(= (second line) %)))
           level (count marker)
           attrs (extract-attrs (apply str (drop (inc level) line)))
@@ -442,7 +318,7 @@
 
 # Section One
 
-This is some section content.
+This is some **section** content.
 This is a second line in the first paragraph.
 
 |= block
